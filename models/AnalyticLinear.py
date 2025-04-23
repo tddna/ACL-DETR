@@ -24,7 +24,8 @@ import torch
 from torch.nn import functional as F
 from typing import Optional, Union
 from abc import abstractmethod, ABCMeta
-
+import numpy as np
+import torch.distributed as dist
 
 class AnalyticLinear(torch.nn.Linear, metaclass=ABCMeta):
     def __init__(
@@ -96,9 +97,9 @@ class RecursiveLinear(AnalyticLinear):
         self.R: torch.Tensor
         R = torch.eye(self.weight.shape[0], **factory_kwargs) / self.gamma
         self.register_buffer("R", R)
-        
+
     @torch.no_grad()
-    def fit(self, X: torch.Tensor, Y: torch.Tensor, accelerator=None) -> None:
+    def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         X = X.reshape(-1, X.shape[-1])
         Y = Y.reshape(-1, Y.shape[-1])
         X, Y = X.to(self.weight), Y.to(self.weight)
@@ -115,29 +116,18 @@ class RecursiveLinear(AnalyticLinear):
             tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
             Y = torch.cat((Y, tail), dim=1)
 
-        # 使用CPU计算逆矩阵，避免CUDA内存不足
-        K_inv = torch.eye(X.shape[0]).to(X) + X @ self.R @ X.T
-        K = torch.inverse(K_inv.cpu()).to(self.weight.device)
-        
-        # 更新参数
+        K = torch.inverse(torch.eye(X.shape[0]).to(X) + X @ self.R @ X.T)
         self.R -= self.R @ X.T @ K @ X @ self.R
         self.weight += self.R @ X.T @ (Y - X @ self.weight)
 
-        # 使用Accelerator同步参数
-        if accelerator is not None and accelerator.num_processes > 1:
-            # 收集所有进程的参数
-            gathered_weights = accelerator.gather(self.weight)
-            gathered_R = accelerator.gather(self.R)
-            
-            # 在每个进程上计算平均值
-            if accelerator.is_main_process:
-                # 主进程计算平均值
-                self.weight = gathered_weights.mean(dim=0)
-                self.R = gathered_R.mean(dim=0)
-            
-            # 广播主进程的结果到所有进程
-            self.weight = accelerator.broadcast(self.weight)
-            self.R = accelerator.broadcast(self.R)
+        if dist.is_initialized():
+            dist.all_reduce(self.weight, op=dist.ReduceOp.SUM)
+            self.weight /= dist.get_world_size()
+
+            dist.all_reduce(self.R, op=dist.ReduceOp.SUM)
+            self.R /= dist.get_world_size()
+        
+    
     # @torch.no_grad()
     # def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
     #     """The core code of the ACIL and the G-ACIL.
@@ -148,12 +138,9 @@ class RecursiveLinear(AnalyticLinear):
     #     # print(X.shape)
     #     # print("Y.shape")
     #     # print(Y.shape)
-        
-    #     X = X.reshape(-1, X.shape[-1])
-        
-    #     Y = Y.reshape(-1, Y.shape[-1])
 
-        
+    #     X = X.reshape(-1, X.shape[-1])
+    #     Y = Y.reshape(-1, Y.shape[-1])
     #     X, Y = X.to(self.weight), Y.to(self.weight)
     #     if self.bias:
     #         X = torch.cat((X, torch.ones(X.shape[0], 1).to(X)), dim=-1)
@@ -167,16 +154,31 @@ class RecursiveLinear(AnalyticLinear):
     #         increment_size = self.out_features - num_targets
     #         tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
     #         Y = torch.cat((Y, tail), dim=1)
-    #     # print(self.R.shape)
-    #     # Please update your PyTorch & CUDA if the `cusolver error` occurs.
-    #     # If you insist on using this version, doing the `torch.inverse` on CPUs might help.
-    #     # >>> K_inv = torch.eye(X.shape[0]).to(X) + X @ self.R @ X.T
-    #     # >>> K = torch.inverse(K_inv.cpu()).to(self.weight.device)
+            
     #     K = torch.inverse(torch.eye(X.shape[0]).to(X) + X @ self.R @ X.T)
     #     # Equation (10) of ACIL
     #     self.R -= self.R @ X.T @ K @ X @ self.R
     #     # Equation (9) of ACIL
     #     self.weight += self.R @ X.T @ (Y - X @ self.weight)
+    #     # print(self.R.shape)
+    #     # Please update your PyTorch & CUDA if the `cusolver error` occurs.
+    #     # If you insist on using this version, doing the `torch.inverse` on CPUs might help.
+    #     # X_np = X.cpu().detach().numpy()
+    #     # R_np = self.R.cpu().detach().numpy()
+
+    #     # I_np = np.eye(X_np.shape[0], dtype=X_np.dtype)
+    #     # XR = np.matmul(X_np, R_np)
+    #     # XRXt = np.matmul(XR, X_np.T)
+    #     # K_inv_np = I_np + XRXt
+
+    #     # K_np = np.linalg.inv(K_inv_np)
+
+    #     # K = torch.from_numpy(K_np).to(self.weight.device)
+
+    #     # # Equation (10) of ACIL
+    #     # self.R -= self.R @ X.T @ K @ X @ self.R
+    #     # # Equation (9) of ACIL
+    #     # self.weight += self.R @ X.T @ (Y - X @ self.weight)
 
 
 class GeneralizedARM(AnalyticLinear):

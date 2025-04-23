@@ -7,8 +7,6 @@ from torch import nn
 import math
 from tqdm import tqdm
 from torch.utils.data import TensorDataset, DataLoader
-import gc
-import numpy as np
 
 
 from util import box_ops
@@ -24,6 +22,7 @@ from .deformable_transformer import build_deforamble_transformer
 import copy
 
 from .ACIL import ACILClassifierForDETR, get_src_permutation_idx_public
+import torch.distributed as dist
 
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
@@ -111,37 +110,6 @@ class DeformableDETR(nn.Module):
             for box_embed in self.bbox_embed:
                 nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
 
-    
-    # def get_hs(self,samples):
-    #     if not isinstance(samples, NestedTensor):
-    #         samples = nested_tensor_from_tensor_list(samples)
-    #     features,pos = self.backbone(samples)
-    #     srcs = []
-    #     masks = []
-    #     for l,feat in enumerate(features):
-    #         src,mask = feat.decompose()
-    #         srcs.append(self.input_proj[l](src))
-    #         masks.append(mask)
-    #         assert mask is not None
-    #     if self.num_feature_levels > len(srcs):
-    #         _len_srcs = len(srcs)
-    #         for l in range(_len_srcs,self.num_feature_levels):
-    #             if l == _len_srcs:
-    #                 src = self.input_proj[l](features[-1].tensors)
-    #             else:
-    #                 src = self.input_proj[l](srcs[-1])
-    #             m = samples.mask
-    #             mask = F.interpolate(m[None].float(),size=src.shape[-2:]).to(torch.bool)[0]
-    #             pos_l = self.backbone[1](NestedTensor(src,mask)).to(src.dtype)
-    #             srcs.append(src)
-    #             masks.append(mask)
-    #             pos.append(pos_l)
-                    
-    #     query_embeds = None
-    #     if not self.two_stage:
-    #         query_embeds = self.query_embed.weight
-    #     hs,init_reference,inter_references,enc_outputs_class,enc_outputs_coord_unact = self.transformer(srcs,masks,pos,query_embeds)
-    #     return hs
             
     def forward(self, samples: NestedTensor):
         """ The forward expects a NestedTensor, which consists of:
@@ -219,14 +187,6 @@ class DeformableDETR(nn.Module):
         return out
 
 
-    # @torch.no_grad()
-    # def acl_fit(self, hs, target_classes_onehot):
-    #     """在CPU上执行拟合操作"""
-    #     temp_dataset = TensorDataset(hs,target_classes_onehot)
-    #     temp_dataloader = DataLoader(temp_dataset,batch_size=64,shuffle=True)
-    #     for batch_hs,batch_target_classes_onehot in temp_dataloader:
-    #         for i in range(len(self.class_embed)):
-    #             self.class_embed[i].fit(batch_hs[i],batch_target_classes_onehot)
     @torch.no_grad()
     def acl_fit(self, hs, target_classes_onehot):
         temp_dataset = TensorDataset(hs,target_classes_onehot)
@@ -238,6 +198,7 @@ class DeformableDETR(nn.Module):
                     self.class_embed[i].fit(batch_hs[:,i],batch_target_classes_onehot)
                 pbar.set_postfix(batch=f"{batch_idx+1}/{total_batches}")
                 pbar.update(1)
+
 
 
     # @torch.no_grad()
@@ -256,7 +217,7 @@ class DeformableDETR(nn.Module):
         return [{'pred_logits': a, 'pred_boxes': b}
                 for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
 
-    def modify_acl_mode(self, buffer_size=8192, gamma=1e-3, accelerator=None):
+    def modify_acl_mode(self, buffer_size=8192, gamma=1e-3):
         self.use_acil = True
 
         num_pred = len(self.class_embed)
@@ -273,16 +234,10 @@ class DeformableDETR(nn.Module):
 
         self.class_embed = new_class_embed
 
-        # 使用Accelerator进行参数同步
-        if accelerator is not None and accelerator.num_processes > 1:
-            # 确保在多进程环境下参数同步
+        if dist.is_initialized():
             for i in range(num_pred):
                 for param in self.class_embed[i].parameters():
-                    # 使用Accelerator广播参数
-                    param.data = accelerator.broadcast(param.data)
-                
-            # 等待所有进程完成
-            accelerator.wait_for_everyone()
+                    dist.broadcast(param.data, src=0)
 
         if self.two_stage:
             self.transformer.decoder.class_embed = self.class_embed
@@ -294,14 +249,8 @@ class DeformableDETR(nn.Module):
             if 'bbox_embed' not in name and 'class_embed' not in name:
                 param.requires_grad = False
 
-        # 如果使用Accelerator，重新准备模型
-        if accelerator is not None:
-            accelerator.wait_for_everyone()
-        
-        return self
-
-    
-    
+            
+            
 class SetCriterion(nn.Module):
     """ This class computes the loss for DETR.
     The process happens in two steps:
@@ -325,8 +274,7 @@ class SetCriterion(nn.Module):
         self.losses = losses
         self.focal_alpha = focal_alpha
         self.acil_cache = []
-        self.cache_hs = True
-        
+
     def get_targets_classes_onehot(self,outputs,targets,indices):
         idx = get_src_permutation_idx_public(indices)
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
@@ -359,7 +307,7 @@ class SetCriterion(nn.Module):
         loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
         
         
-        if not enable_aux and self.cache_hs:
+        if not enable_aux:
             assert 'dec_outputs' in outputs
             hs = outputs['dec_outputs'] 
 
@@ -369,7 +317,7 @@ class SetCriterion(nn.Module):
             for f, l in zip(hs, target_classes_onehot):
                 f_all.append(f.detach().cpu())
                 l_all.append(l.detach().cpu())
-            self.acil_cache.append((torch.stack(f_all,dim=0), torch.stack(l_all,dim=0)))   
+            self.acil_cache.append((torch.stack(f_all,dim=0), torch.stack(l_all,dim=0))) 
         
         losses = {'loss_ce': loss_ce}
         
@@ -533,6 +481,7 @@ class SetCriterion(nn.Module):
     def get_acil_cache(self):
         hs = torch.cat([f for f, _ in self.acil_cache], dim=0)
         labels = torch.cat([l for _, l in self.acil_cache], dim=0)
+        # print(hs.shape,labels.shape)
         return hs, labels
 
     def clear_acil_cache(self):

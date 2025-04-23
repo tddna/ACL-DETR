@@ -93,23 +93,17 @@ class SmoothedValue(object):
 
     @property
     def global_avg(self):
-        return self.total / self.count if self.count > 0 else 0.0
+        return self.total / self.count
 
     @property
     def max(self):
-        if len(self.deque) == 0:
-            return 0.0  # 返回默认值
         return max(self.deque)
 
     @property
     def value(self):
-        if len(self.deque) == 0:
-            return 0.0  # 返回默认值
         return self.deque[-1]
 
     def __str__(self):
-        if len(self.deque) == 0:
-            return "no data"
         return self.fmt.format(
             median=self.median,
             avg=self.avg,
@@ -224,10 +218,6 @@ class MetricLogger(object):
         self.meters[name] = meter
 
     def log_every(self, iterable, print_freq, header=None):
-        if len(iterable) == 0:
-            print("警告：迭代器为空，跳过日志记录")
-            return iter([])
-        
         i = 0
         if not header:
             header = ''
@@ -403,11 +393,7 @@ def get_rank():
 def get_local_size():
     if not is_dist_avail_and_initialized():
         return 1
-    try:
-        return int(os.environ['LOCAL_SIZE'])
-    except KeyError:
-        # 如果环境变量不存在，返回可见GPU数量
-        return torch.cuda.device_count()
+    return int(os.environ['LOCAL_SIZE'])
 
 
 def get_local_rank():

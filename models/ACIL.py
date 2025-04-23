@@ -5,7 +5,7 @@ from .AnalyticLinear import RecursiveLinear
 from .Buffer import RandomBuffer
 
 class ACILClassifierForDETR(nn.Module):
-    def __init__(self, input_dim, num_classes, buffer_size=128, gamma=1e-3, device=None, dtype=torch.double):
+    def __init__(self, input_dim, num_classes, buffer_size=8192, gamma=1e-3, device=None, dtype=torch.double):
         super().__init__()
         self.input_dim = input_dim
         self.num_classes = num_classes
@@ -18,7 +18,7 @@ class ACILClassifierForDETR(nn.Module):
         self.buffer = RandomBuffer(input_dim, buffer_size, device=device, dtype=dtype)
         # 解析分类器（RecursiveLinear）
         self.analytic_linear = RecursiveLinear(buffer_size, gamma, device=device, dtype=dtype)
-        
+
         # eval 模式（解析学习不用 BP）
         self.eval()
 
@@ -43,11 +43,12 @@ class ACILClassifierForDETR(nn.Module):
 
 
     
-    # @torch.no_grad()
-    # def update(self) -> None:
-
-    #     """
-    #     self.analytic_linear.update()
+    @torch.no_grad()
+    def update(self) -> None:
+        """
+        用于在 batch 式 ACIL 中做最后的权重更新
+        """
+        self.analytic_linear.update()
 
 
 def get_src_permutation_idx_public(indices):
