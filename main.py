@@ -25,6 +25,10 @@ from torch.utils.data import TensorDataset
  
 from util.report import save_evaluation_results
 
+from torch.utils.tensorboard import SummaryWriter
+
+torch.cuda.empty_cache()
+
 def get_args_parser():
     parser = argparse.ArgumentParser('Deformable DETR Detector', add_help=False)
     parser.add_argument('--lr', default=2e-4, type=float)
@@ -147,10 +151,12 @@ def get_args_parser():
 def main(args):
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
+    
+    writer = SummaryWriter(log_dir="./logs")
 
-    if args.frozen_weights is not None:
-        assert args.masks, "Frozen training is meant for segmentation only"
-    print(args)
+    # if args.frozen_weights is not None:
+    #     assert args.masks, "Frozen training is meant for segmentation only"
+    # print(args)
 
     device = torch.device(args.device)
 
@@ -318,6 +324,7 @@ def main(args):
 
         ### h1.base training e.g 在40上训练
         if phase_idx==0:
+        #################################################################################################
             ckpt_path = './phase_0.pth'          
             checkpoint = torch.load(ckpt_path, map_location='cpu')
 
@@ -342,7 +349,7 @@ def main(args):
                 lr_scheduler.base_lrs = list(map(lambda group: group['initial_lr'], optimizer.param_groups))
             lr_scheduler.step(lr_scheduler.last_epoch)
             args.start_epoch = checkpoint['epoch'] + 1
-            
+        #################################################################################################
             # base training,前面部分应该更换为deformable detr的预训练模型
             for epoch in range(0, 1):
                 if args.distributed:
@@ -358,9 +365,22 @@ def main(args):
             save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_base')
             
             hs, target_classes_onehot = criterion.get_acil_cache()
-            model.module.modify_acl_mode(buffer_size=256, gamma=1e-3)
+            torch.cuda.empty_cache()
+  
+            model.module.modify_acl_mode(buffer_size=128, gamma=1e-3)
             model.module.acl_fit(hs, target_classes_onehot)
             
+            print("acl_fit done")
+            # # 保存模型，包括acl部分的参数
+            # torch.save({
+            #     'model': model_without_ddp.state_dict(),
+            #     'optimizer': optimizer.state_dict(),
+            #     'lr_scheduler': lr_scheduler.state_dict(),
+            #     'epoch': epoch,
+            #     'args': args,
+            # }, output_dir / 'checkpoint.pth')
+                
+                
             test_stats, coco_evaluator = evaluate(
                 model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
             )
@@ -434,6 +454,10 @@ def main(args):
             total_time_str = str(datetime.timedelta(seconds=int(total_time)))
             print('Training time {}'.format(total_time_str))
 
+            # 在主训练循环中
+            optimizer.zero_grad()
+            torch.cuda.synchronize()
+            dist.barrier()  # 添加额外同步点
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Deformable DETR training and evaluation script', parents=[get_args_parser()])

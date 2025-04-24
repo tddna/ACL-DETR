@@ -73,7 +73,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 def train_one_epoch_incremental(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, max_norm: float = 0):
+                    device: torch.device, epoch: int, max_norm: float = 0) :
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -130,15 +130,24 @@ def train_one_epoch_incremental(model: torch.nn.Module, criterion: torch.nn.Modu
         target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
         target_classes_onehot = target_classes_onehot[:,:,:-1]
         
-        # get the hc
+        # get the hs
         hs = outputs['dec_outputs']
 
-        model.module.acl_fit(hs,target_classes_onehot)
+        if hasattr(model, 'module'):  
+            model.module.acl_fit(hs, target_classes_onehot)
+        else:  
+            model.acl_fit(hs, target_classes_onehot)
+            
+        if dist.is_initialized():
+            dist.barrier()
                     
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
         metric_logger.update(class_error=loss_dict_reduced['class_error'])
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(grad_norm=grad_total_norm)
+        
+        # if writer is not None:
+            
 
         samples, targets = prefetcher.next()
     # gather the stats from all processes

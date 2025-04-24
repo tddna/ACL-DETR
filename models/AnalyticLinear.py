@@ -100,6 +100,7 @@ class RecursiveLinear(AnalyticLinear):
 
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
+
         X = X.reshape(-1, X.shape[-1])
         Y = Y.reshape(-1, Y.shape[-1])
         X, Y = X.to(self.weight), Y.to(self.weight)
@@ -121,13 +122,16 @@ class RecursiveLinear(AnalyticLinear):
         self.weight += self.R @ X.T @ (Y - X @ self.weight)
 
         if dist.is_initialized():
+            torch.cuda.synchronize()
+            
             dist.all_reduce(self.weight, op=dist.ReduceOp.SUM)
             self.weight /= dist.get_world_size()
 
             dist.all_reduce(self.R, op=dist.ReduceOp.SUM)
             self.R /= dist.get_world_size()
-        
-    
+            
+            torch.cuda.synchronize()
+            dist.barrier()
     # @torch.no_grad()
     # def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
     #     """The core code of the ACIL and the G-ACIL.

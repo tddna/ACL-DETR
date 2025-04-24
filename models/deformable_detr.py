@@ -186,18 +186,38 @@ class DeformableDETR(nn.Module):
             out['enc_outputs'] = {'pred_logits': enc_outputs_class, 'pred_boxes': enc_outputs_coord}
         return out
 
-
     @torch.no_grad()
     def acl_fit(self, hs, target_classes_onehot):
-        temp_dataset = TensorDataset(hs,target_classes_onehot)
-        temp_dataloader = DataLoader(temp_dataset,batch_size=2,shuffle=True)
+
+        
+        temp_dataset = TensorDataset(hs, target_classes_onehot)
+        temp_dataloader = DataLoader(temp_dataset, batch_size=8, shuffle=True)
         total_batches = len(temp_dataloader)
+        
         with tqdm(total=total_batches, desc="acl_fit", leave=True) as pbar:
             for batch_idx, (batch_hs, batch_target_classes_onehot) in enumerate(temp_dataloader):
                 for i in range(len(self.class_embed)):
-                    self.class_embed[i].fit(batch_hs[:,i],batch_target_classes_onehot)
+                    self.class_embed[i].fit(batch_hs[:,i], batch_target_classes_onehot)
+                
                 pbar.set_postfix(batch=f"{batch_idx+1}/{total_batches}")
                 pbar.update(1)
+                
+                del batch_target_classes_onehot  
+                del batch_hs  
+
+
+
+    # @torch.no_grad()
+    # def acl_fit(self, hs, target_classes_onehot):
+    #     temp_dataset = TensorDataset(hs,target_classes_onehot)
+    #     temp_dataloader = DataLoader(temp_dataset,batch_size=2,shuffle=True)
+    #     total_batches = len(temp_dataloader)
+    #     with tqdm(total=total_batches, desc="acl_fit", leave=True) as pbar:
+    #         for batch_idx, (batch_hs, batch_target_classes_onehot) in enumerate(temp_dataloader):
+    #             for i in range(len(self.class_embed)):
+    #                 self.class_embed[i].fit(batch_hs[:,i],batch_target_classes_onehot)
+    #             pbar.set_postfix(batch=f"{batch_idx+1}/{total_batches}")
+    #             pbar.update(1)
 
 
 
@@ -235,9 +255,12 @@ class DeformableDETR(nn.Module):
         self.class_embed = new_class_embed
 
         if dist.is_initialized():
-            for i in range(num_pred):
-                for param in self.class_embed[i].parameters():
-                    dist.broadcast(param.data, src=0)
+            try:
+                for i in range(num_pred):
+                    for param in self.class_embed[i].parameters():
+                        dist.broadcast(param.data, src=0)
+            except Exception as e:
+                print(f"分布式参数广播失败: {e}")
 
         if self.two_stage:
             self.transformer.decoder.class_embed = self.class_embed
