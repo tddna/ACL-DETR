@@ -14,30 +14,22 @@ class ACILClassifierForDETR(nn.Module):
         self.device = device
         self.dtype = dtype
 
-        # 缓存模块：用于特征扩展
+   
         self.buffer = RandomBuffer(input_dim, buffer_size, device=device, dtype=dtype)
-        # 解析分类器（RecursiveLinear）
+
         self.analytic_linear = RecursiveLinear(buffer_size, gamma, device=device, dtype=dtype)
 
-        # eval 模式（解析学习不用 BP）
         self.eval()
 
     @torch.no_grad()
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        """
-        推理逻辑：用于替换 class_embed 的 forward()。
-        输入为 Transformer decoder 输出
-        X:input_dim
-        buffer(X):buffer_size
-        analytic_linear(X):num_classes
-        """
-        X = self.buffer(X)  # 特征扩展
+        X = self.buffer(X)  
         return self.analytic_linear(X)  
 
     @torch.no_grad()
     def fit(self, X, targets_classes_onehot) :
  
-        X = self.buffer(X)  # 特征扩展
+        X = self.buffer(X)  
         
         self.analytic_linear.fit(X, targets_classes_onehot)
 
@@ -45,9 +37,6 @@ class ACILClassifierForDETR(nn.Module):
     
     @torch.no_grad()
     def update(self) -> None:
-        """
-        用于在 batch 式 ACIL 中做最后的权重更新
-        """
         self.analytic_linear.update()
 
 
