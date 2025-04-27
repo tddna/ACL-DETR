@@ -132,11 +132,14 @@ def train_one_epoch_incremental(model: torch.nn.Module, criterion: torch.nn.Modu
         
         # get the hs
         hs = outputs['dec_outputs']
+        hs = hs.transpose(0,1).contiguous()
+        
 
-        if hasattr(model, 'module'):  
+        if isinstance(model, torch.nn.parallel.DistributedDataParallel):
             model.module.acl_fit(hs, target_classes_onehot)
-        else:  
+        else:
             model.acl_fit(hs, target_classes_onehot)
+
             
         if dist.is_initialized():
             dist.barrier()
@@ -146,8 +149,6 @@ def train_one_epoch_incremental(model: torch.nn.Module, criterion: torch.nn.Modu
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(grad_norm=grad_total_norm)
         
-        # if writer is not None:
-            
 
         samples, targets = prefetcher.next()
     # gather the stats from all processes

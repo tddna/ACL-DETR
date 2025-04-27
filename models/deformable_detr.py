@@ -7,7 +7,7 @@ from torch import nn
 import math
 from tqdm import tqdm
 from torch.utils.data import TensorDataset, DataLoader
-
+import gc
 
 from util import box_ops
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
@@ -31,7 +31,7 @@ def _get_clones(module, N):
 class DeformableDETR(nn.Module):
     """ This is the Deformable DETR module that performs object detection """
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,
-                 aux_loss=True, with_box_refine=False, two_stage=False, use_acil=False):
+                 aux_loss=True, with_box_refine=False, two_stage=False, use_acil=False, buffer_size=128, gamma=1e-3, acil_device='cpu'):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -48,6 +48,8 @@ class DeformableDETR(nn.Module):
         self.transformer = transformer
         hidden_dim = transformer.d_model
         self.class_embed = nn.Linear(hidden_dim, num_classes)
+        self.class_embed_acil = ACILClassifierForDETR(hidden_dim, num_classes, buffer_size, gamma, acil_device)
+        
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.num_feature_levels = num_feature_levels
         if not two_stage:
@@ -81,6 +83,7 @@ class DeformableDETR(nn.Module):
         
         # === ACIL 分类头接口 ===
         self.use_acil = False
+        
 
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
@@ -95,6 +98,7 @@ class DeformableDETR(nn.Module):
         num_pred = (transformer.decoder.num_layers + 1) if two_stage else transformer.decoder.num_layers
         if with_box_refine:
             self.class_embed = _get_clones(self.class_embed, num_pred)
+            self.class_embed_acil = _get_clones(self.class_embed_acil, num_pred)
             self.bbox_embed = _get_clones(self.bbox_embed, num_pred)
             nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
             # hack implementation for iterative bounding box refinement
@@ -102,11 +106,13 @@ class DeformableDETR(nn.Module):
         else:
             nn.init.constant_(self.bbox_embed.layers[-1].bias.data[2:], -2.0)
             self.class_embed = nn.ModuleList([self.class_embed for _ in range(num_pred)])
+            self.class_embed_acil = nn.ModuleList([self.class_embed_acil for _ in range(num_pred)])
             self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(num_pred)])
             self.transformer.decoder.bbox_embed = None
         if two_stage:
             # hack implementation for two-stage
             self.transformer.decoder.class_embed = self.class_embed
+            self.transformer.decoder.class_embed_acil = self.class_embed_acil
             for box_embed in self.bbox_embed:
                 nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
 
@@ -164,7 +170,10 @@ class DeformableDETR(nn.Module):
             else:
                 reference = inter_references[lvl - 1]
             reference = inverse_sigmoid(reference)
-            outputs_class = self.class_embed[lvl](hs[lvl])
+            if self.use_acil:
+                outputs_class = self.class_embed_acil[lvl](hs[lvl])
+            else:
+                outputs_class = self.class_embed[lvl](hs[lvl])
             tmp = self.bbox_embed[lvl](hs[lvl])
             if reference.shape[-1] == 4:
                 tmp += reference
@@ -188,46 +197,22 @@ class DeformableDETR(nn.Module):
 
     @torch.no_grad()
     def acl_fit(self, hs, target_classes_onehot):
-
-        
         temp_dataset = TensorDataset(hs, target_classes_onehot)
-        temp_dataloader = DataLoader(temp_dataset, batch_size=8, shuffle=True)
+        temp_dataloader = DataLoader(temp_dataset, batch_size=4, shuffle=True)
         total_batches = len(temp_dataloader)
         
         with tqdm(total=total_batches, desc="acl_fit", leave=True) as pbar:
             for batch_idx, (batch_hs, batch_target_classes_onehot) in enumerate(temp_dataloader):
-                for i in range(len(self.class_embed)):
-                    self.class_embed[i].fit(batch_hs[:,i], batch_target_classes_onehot)
-                
+                for i in range(len(self.class_embed_acil)):
+                    self.class_embed_acil[i].fit(batch_hs[:,i], batch_target_classes_onehot)
+            
                 pbar.set_postfix(batch=f"{batch_idx+1}/{total_batches}")
                 pbar.update(1)
                 
                 del batch_target_classes_onehot  
                 del batch_hs  
-
-
-
-    # @torch.no_grad()
-    # def acl_fit(self, hs, target_classes_onehot):
-    #     temp_dataset = TensorDataset(hs,target_classes_onehot)
-    #     temp_dataloader = DataLoader(temp_dataset,batch_size=2,shuffle=True)
-    #     total_batches = len(temp_dataloader)
-    #     with tqdm(total=total_batches, desc="acl_fit", leave=True) as pbar:
-    #         for batch_idx, (batch_hs, batch_target_classes_onehot) in enumerate(temp_dataloader):
-    #             for i in range(len(self.class_embed)):
-    #                 self.class_embed[i].fit(batch_hs[:,i],batch_target_classes_onehot)
-    #             pbar.set_postfix(batch=f"{batch_idx+1}/{total_batches}")
-    #             pbar.update(1)
-
-
-
-    # @torch.no_grad()
-    # def acl_update(self):
-    #     for i in tqdm(range(len(self.class_embed)),desc="acl_update"):
-    #         self.class_embed[i].update()
-    #     print("acl_update done")
-                
-            
+        torch.cuda.empty_cache()
+        gc.collect()  
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord):
@@ -237,40 +222,48 @@ class DeformableDETR(nn.Module):
         return [{'pred_logits': a, 'pred_boxes': b}
                 for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
 
-    def modify_acl_mode(self, buffer_size=8192, gamma=1e-3):
-        self.use_acil = True
-
-        num_pred = len(self.class_embed)
-        hidden_dim = self.transformer.d_model
-        num_classes = self.class_embed[0].weight.shape[0]
-        device = self.class_embed[0].weight.device
-
-        new_classifier = ACILClassifierForDETR(hidden_dim, num_classes, buffer_size, gamma, device)
-
-        if self.with_box_refine:
-            new_class_embed = _get_clones(new_classifier, num_pred)
-        else:
-            new_class_embed = nn.ModuleList([new_classifier for _ in range(num_pred)])
-
-        self.class_embed = new_class_embed
-
-        if dist.is_initialized():
-            try:
-                for i in range(num_pred):
-                    for param in self.class_embed[i].parameters():
-                        dist.broadcast(param.data, src=0)
-            except Exception as e:
-                print(f"分布式参数广播失败: {e}")
-
-        if self.two_stage:
-            self.transformer.decoder.class_embed = self.class_embed
-            for box_embed in self.bbox_embed:
-                nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
-
-        # 冻结其余层
+    def modify_acl_mode(self,use_acil=True):
+        self.use_acil = use_acil
+        
+       # 冻结其余层
         for name, param in self.named_parameters():
-            if 'bbox_embed' not in name and 'class_embed' not in name:
+            if 'bbox_embed' not in name and 'class_embed_acil' not in name:
                 param.requires_grad = False
+
+    # def modify_acl_mode(self, buffer_size=8192, gamma=1e-3):
+    #     self.use_acil = True
+
+    #     num_pred = len(self.class_embed)
+    #     hidden_dim = self.transformer.d_model
+    #     num_classes = self.class_embed[0].weight.shape[0]
+    #     device = self.class_embed[0].weight.device
+
+    #     new_classifier = ACILClassifierForDETR(hidden_dim, num_classes, buffer_size, gamma, device)
+
+    #     if self.with_box_refine:
+    #         new_class_embed = _get_clones(new_classifier, num_pred)
+    #     else:
+    #         new_class_embed = nn.ModuleList([new_classifier for _ in range(num_pred)])
+
+    #     self.class_embed = new_class_embed
+
+    #     if dist.is_initialized():
+    #         try:
+    #             for i in range(num_pred):
+    #                 for param in self.class_embed[i].parameters():
+    #                     dist.broadcast(param.data, src=0)
+    #         except Exception as e:
+    #             print(f"分布式参数广播失败: {e}")
+
+    #     if self.two_stage:
+    #         self.transformer.decoder.class_embed = self.class_embed
+    #         for box_embed in self.bbox_embed:
+    #             nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
+
+    #     # 冻结其余层
+    #     for name, param in self.named_parameters():
+    #         if 'bbox_embed' not in name and 'class_embed' not in name:
+    #             param.requires_grad = False
 
             
             
@@ -586,6 +579,10 @@ def build(args):
         aux_loss=args.aux_loss,
         with_box_refine=args.with_box_refine,
         two_stage=args.two_stage,
+        use_acil=args.use_acil,
+        buffer_size=args.buffer_size,
+        gamma=args.gamma,
+        acil_device=args.acil_device
     )
     # DETRsegm 用于语义分割, 可忽略
     if args.masks:

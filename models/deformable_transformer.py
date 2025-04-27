@@ -16,7 +16,7 @@ class DeformableTransformer(nn.Module):
                  num_encoder_layers=6, num_decoder_layers=6, dim_feedforward=1024, dropout=0.1,
                  activation="relu", return_intermediate_dec=False,
                  num_feature_levels=4, dec_n_points=4,  enc_n_points=4,
-                 two_stage=False, two_stage_num_proposals=300):
+                 two_stage=False, two_stage_num_proposals=300,use_acil = False):
         super().__init__()
 
         self.d_model = d_model
@@ -149,7 +149,10 @@ class DeformableTransformer(nn.Module):
             output_memory, output_proposals = self.gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes)
 
             # hack implementation for two-stage Deformable DETR
-            enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory)
+            if self.use_acil:
+                enc_outputs_class = self.decoder.class_embed_acil[self.decoder.num_layers](output_memory)
+            else:
+                enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory)
             enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals
 
             topk = self.two_stage_num_proposals
@@ -312,7 +315,7 @@ class DeformableTransformerDecoder(nn.Module):
         # hack implementation for iterative bounding box refinement and two-stage Deformable DETR
         self.bbox_embed = None
         self.class_embed = None
-
+        self.class_embed_acil = None
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
                 query_pos=None, src_padding_mask=None):
         output = tgt
@@ -380,6 +383,8 @@ def build_deforamble_transformer(args):
         dec_n_points=args.dec_n_points,
         enc_n_points=args.enc_n_points,
         two_stage=args.two_stage,
-        two_stage_num_proposals=args.num_queries)
+        two_stage_num_proposals=args.num_queries,
+        use_acil=args.use_acil
+        )
 
 

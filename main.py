@@ -36,7 +36,7 @@ def get_args_parser():
     parser.add_argument('--lr_backbone', default=2e-5, type=float)
     parser.add_argument('--lr_linear_proj_names', default=['reference_points', 'sampling_offsets'], type=str, nargs='+')
     parser.add_argument('--lr_linear_proj_mult', default=0.1, type=float)
-    parser.add_argument('--batch_size', default=4, type=int)
+    parser.add_argument('--batch_size', default=2, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=1, type=int)
     parser.add_argument('--lr_drop', default=40, type=int)
@@ -120,7 +120,7 @@ def get_args_parser():
     parser.add_argument('--coco_panoptic_path', type=str)
     parser.add_argument('--remove_difficult', action='store_true')
 
-    parser.add_argument('--output_dir', default='',
+    parser.add_argument('--output_dir', default='./output',
                         help='path where to save, empty for no saving')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
@@ -145,6 +145,11 @@ def get_args_parser():
     parser.add_argument('--balanced_ft', default=True, action='store_true')
     parser.add_argument('--total_num_classes', default=91, type=int)
     
+    parser.add_argument('--use_acil', default=False, action='store_true')
+    parser.add_argument('--buffer_size', default=128, type=int)
+    parser.add_argument('--gamma', default=1e-3, type=float)
+    parser.add_argument('--acil_device', default='cpu', type=str)
+    
 
     return parser
 
@@ -154,9 +159,6 @@ def main(args):
     
     writer = SummaryWriter(log_dir="./logs")
 
-    # if args.frozen_weights is not None:
-    #     assert args.masks, "Frozen training is meant for segmentation only"
-    # print(args)
 
     device = torch.device(args.device)
 
@@ -169,10 +171,7 @@ def main(args):
     model.to(device)
 
     model_without_ddp = model
-    
-    # n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    # print('number of params:', n_parameters) --> 
-        
+
     cls_order = generate_cls_order(seed=args.seed_cls)   
 
     if args.data_setting=='tfs':
@@ -181,11 +180,11 @@ def main(args):
         total_phase_num = args.num_of_phases
     else:
         raise ValueError('Please set the correct data setting.')
-
-    img_memory = {}
-    ann_memory = {}
-    imgToAnns_memory = {}
-
+    
+    print('pytorch model distributed...')
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+        model_without_ddp = model.module
     
     for phase_idx in range(total_phase_num):
         print('training phase '+ str(phase_idx) + '...')
@@ -199,9 +198,9 @@ def main(args):
             dataset_train_balanced = build_dataset(image_set='train', args=args, cls_order=cls_order, \
                 phase_idx=phase_idx, incremental=True, incremental_val=False, val_each_phase=False, balanced_ft=True)
             dataset_val_old = build_dataset(image_set='val', args=args, cls_order=cls_order, \
-                phase_idx=0, incremental=True, incremental_val=True, val_each_phase=False)
+                phase_idx=phase_idx-1, incremental=True, incremental_val=True, val_each_phase=False)
             dataset_val_new = build_dataset(image_set='val', args=args, cls_order=cls_order, \
-                phase_idx=1, incremental=True, incremental_val=True, val_each_phase=True)
+                phase_idx=phase_idx, incremental=True, incremental_val=True, val_each_phase=True)
 
         # 分布式训练
         if args.distributed:
@@ -296,10 +295,11 @@ def main(args):
                                             weight_decay=args.weight_decay)
             lr_scheduler_balanced = torch.optim.lr_scheduler.StepLR(optimizer_balanced, args.lr_drop_balanced)
 
-        print('pytorch model distributed...')
-        if args.distributed:
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
-            model_without_ddp = model.module
+        # print('pytorch model distributed...')
+        # if args.distributed:
+        #     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+        #     model_without_ddp = model.module
+
 
         ## e. 评估coco api构建
         base_ds = get_coco_api_from_dataset(dataset_val)
@@ -307,10 +307,10 @@ def main(args):
             base_ds_old = get_coco_api_from_dataset(dataset_val_old)
             base_ds_new = get_coco_api_from_dataset(dataset_val_new)
 
-        ## f. 加载预训练模型
-        if args.frozen_weights is not None:
-            checkpoint = torch.load(args.frozen_weights, map_location='cpu')
-            model_without_ddp.detr.load_state_dict(checkpoint['model'])
+        # ## f. 加载预训练模型
+        # if args.frozen_weights is not None:
+        #     checkpoint = torch.load(args.frozen_weights, map_location='cpu')
+        #     model_without_ddp.detr.load_state_dict(checkpoint['model'])
 
         ## g. 输出目录
         this_phase_output_dir = args.output_dir + '/phase_'+str(phase_idx)
@@ -367,27 +367,32 @@ def main(args):
             hs, target_classes_onehot = criterion.get_acil_cache()
             torch.cuda.empty_cache()
   
-            model.module.modify_acl_mode(buffer_size=128, gamma=1e-3)
+            model_without_ddp.modify_acl_mode(True)
+      
             model.module.acl_fit(hs, target_classes_onehot)
             
             print("acl_fit done")
-            # # 保存模型，包括acl部分的参数
-            # torch.save({
-            #     'model': model_without_ddp.state_dict(),
-            #     'optimizer': optimizer.state_dict(),
-            #     'lr_scheduler': lr_scheduler.state_dict(),
-            #     'epoch': epoch,
-            #     'args': args,
-            # }, output_dir / 'checkpoint.pth')
-                
                 
             test_stats, coco_evaluator = evaluate(
                 model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
             )
             print("Testing results for phase_0.")   
-            save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_realign')
-                        
+            save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_realign')   
+            
+            if args.output_dir:
+                checkpoint_paths = [output_dir / f'phase_{phase_idx}.pth']
+
+                for checkpoint_path in checkpoint_paths:
+                    utils.save_on_master({
+                        'model': model_without_ddp.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'lr_scheduler': lr_scheduler.state_dict(),
+                        'epoch': epoch,
+                        'args': args,
+                    }, checkpoint_path)
+        
         else:
+            
             for epoch in range(0, args.epochs):
                 if args.distributed:
                     sampler_train.set_epoch(epoch)
@@ -439,7 +444,7 @@ def main(args):
                 save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_F-all')
             
             if args.output_dir:
-                checkpoint_paths = [output_dir / 'checkpoint.pth']
+                checkpoint_paths = [output_dir / f'phase_{phase_idx}.pth']
 
                 for checkpoint_path in checkpoint_paths:
                     utils.save_on_master({
