@@ -36,7 +36,7 @@ def get_args_parser():
     parser.add_argument('--lr_backbone', default=2e-5, type=float)
     parser.add_argument('--lr_linear_proj_names', default=['reference_points', 'sampling_offsets'], type=str, nargs='+')
     parser.add_argument('--lr_linear_proj_mult', default=0.1, type=float)
-    parser.add_argument('--batch_size', default=2, type=int)
+    parser.add_argument('--batch_size', default=16, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=1, type=int)
     parser.add_argument('--lr_drop', default=40, type=int)
@@ -141,7 +141,7 @@ def get_args_parser():
     parser.add_argument('--method', default='icarl', choices=['baseline', 'icarl'])
     parser.add_argument('--mem_rate', default=0.1, type=float)
 
-    parser.add_argument('--debug_mode', default=False, action='store_true')
+    parser.add_argument('--debug_mode', default=True, action='store_true')
     parser.add_argument('--balanced_ft', default=True, action='store_true')
     parser.add_argument('--total_num_classes', default=91, type=int)
     
