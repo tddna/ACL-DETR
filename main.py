@@ -36,7 +36,7 @@ def get_args_parser():
     parser.add_argument('--lr_backbone', default=2e-5, type=float)
     parser.add_argument('--lr_linear_proj_names', default=['reference_points', 'sampling_offsets'], type=str, nargs='+')
     parser.add_argument('--lr_linear_proj_mult', default=0.1, type=float)
-    parser.add_argument('--batch_size', default=16, type=int)
+    parser.add_argument('--batch_size', default=4, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=1, type=int)
     parser.add_argument('--lr_drop', default=40, type=int)
@@ -132,8 +132,9 @@ def get_args_parser():
     parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
 
     # 在pycocotools.py中修改
+    # 20 + 
     parser.add_argument('--num_of_phases', default=5, type=int)
-    parser.add_argument('--cls_per_phase', default=10, type=int)
+    parser.add_argument('--cls_per_phase', default=20, type=int)
     parser.add_argument('--data_setting', default='tfh', choices=['tfs', 'tfh'])
 
     parser.add_argument('--seed_cls', default=123, type=int)
@@ -141,7 +142,7 @@ def get_args_parser():
     parser.add_argument('--method', default='icarl', choices=['baseline', 'icarl'])
     parser.add_argument('--mem_rate', default=0.1, type=float)
 
-    parser.add_argument('--debug_mode', default=True, action='store_true')
+    parser.add_argument('--debug_mode', default=False, action='store_true')
     parser.add_argument('--balanced_ft', default=True, action='store_true')
     parser.add_argument('--total_num_classes', default=91, type=int)
     
@@ -373,11 +374,11 @@ def main(args):
             
             print("acl_fit done")
                 
-            test_stats, coco_evaluator = evaluate(
-                model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
-            )
-            print("Testing results for phase_0.")   
-            save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_realign')   
+            # test_stats, coco_evaluator = evaluate(
+            #     model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
+            # )
+            # print("Testing results for phase_0.")   
+            # save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_realign')   
             
             if args.output_dir:
                 checkpoint_paths = [output_dir / f'phase_{phase_idx}.pth']

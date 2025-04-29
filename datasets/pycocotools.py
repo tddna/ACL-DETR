@@ -63,15 +63,15 @@ class COCO:
                         selected_cls_this_phase = cls_order[phase_idx*cls_per_phase:(phase_idx+1)*cls_per_phase]
                 elif tfs_or_tfh == 'tfh':
                     if phase_idx == 0:
-                        selected_cls_this_phase = cls_order[:40]
+                        selected_cls_this_phase = cls_order[:20]
                     else:
                         if incremental_val:
                             if val_each_phase:
-                                selected_cls_this_phase = cls_order[(phase_idx-1)*cls_per_phase+40:(phase_idx)*cls_per_phase+40]
+                                selected_cls_this_phase = cls_order[(phase_idx-1)*cls_per_phase+20:(phase_idx)*cls_per_phase+20]
                             else:
-                                selected_cls_this_phase = cls_order[:(phase_idx)*cls_per_phase+40]
+                                selected_cls_this_phase = cls_order[:(phase_idx)*cls_per_phase+20]
                         else:
-                            selected_cls_this_phase = cls_order[(phase_idx-1)*cls_per_phase+40:(phase_idx)*cls_per_phase+40]
+                            selected_cls_this_phase = cls_order[(phase_idx-1)*cls_per_phase+20:(phase_idx)*cls_per_phase+20]
                 else:
                     raise ValueError('Please set the correct data setting.')
 
@@ -200,15 +200,15 @@ class COCO:
                     selected_cls_this_phase = cls_order[phase_idx*cls_per_phase:(phase_idx+1)*cls_per_phase]
             elif tfs_or_tfh == 'tfh':
                 if phase_idx == 0:
-                    selected_cls_this_phase = cls_order[:40]
+                    selected_cls_this_phase = cls_order[:20]
                 else:
                     if incremental_val:
                         if val_each_phase:
-                            selected_cls_this_phase = cls_order[(phase_idx-1)*cls_per_phase+40:(phase_idx)*cls_per_phase+40]
+                            selected_cls_this_phase = cls_order[(phase_idx-1)*cls_per_phase+20:(phase_idx)*cls_per_phase+20]
                         else:
-                            selected_cls_this_phase = cls_order[:(phase_idx)*cls_per_phase+40]
+                            selected_cls_this_phase = cls_order[:(phase_idx)*cls_per_phase+20]
                     else:
-                        selected_cls_this_phase = cls_order[(phase_idx-1)*cls_per_phase+40:(phase_idx)*cls_per_phase+40]
+                        selected_cls_this_phase = cls_order[(phase_idx-1)*cls_per_phase+20:(phase_idx)*cls_per_phase+20]
             else:
                 raise ValueError('Please set the correct data setting.')
 
