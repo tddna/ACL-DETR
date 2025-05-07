@@ -19,6 +19,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0):
     model.train()
+
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -66,6 +67,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         metric_logger.update(grad_norm=grad_total_norm)
 
         samples, targets = prefetcher.next()
+        
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -135,7 +137,6 @@ def train_one_epoch_incremental(model: torch.nn.Module, criterion: torch.nn.Modu
         hs = outputs['dec_outputs']
         hs = hs.transpose(0,1).contiguous()
         
-
         if isinstance(model, torch.nn.parallel.DistributedDataParallel):
             model.module.acl_fit(hs, target_classes_onehot)
         else:

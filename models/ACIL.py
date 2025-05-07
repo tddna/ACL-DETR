@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from torch import nn
 from .AnalyticLinear import RecursiveLinear
 from .Buffer import RandomBuffer
+import torch.distributed as dist
 
 class ACILClassifierForDETR(nn.Module):
     def __init__(self, input_dim, num_classes, buffer_size=8192, gamma=1e-3, device=None, dtype=torch.double):
@@ -33,6 +34,17 @@ class ACILClassifierForDETR(nn.Module):
         
         self.analytic_linear.fit(X, targets_classes_onehot)
 
+    def sync_across_gpus_all_reduce(self):
+        """使用 all-reduce 同步所有 GPU 上的参数，保证参数一致"""
+        if not dist.is_initialized():
+            return  # 如果没有进行分布式训练，则不需要同步
+
+        for i in range(len(self.class_embed_acil)):
+            module = self.class_embed_acil[i]
+
+            # 对递归层的 weight 和 R 进行 all-reduce
+            dist.all_reduce(module.analytic_linear.weight, op=dist.ReduceOp.SUM)
+            dist.all_reduce(module.analytic_linear.R, op=dist.ReduceOp.SUM)
 
     
     @torch.no_grad()

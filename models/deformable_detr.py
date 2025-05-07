@@ -196,23 +196,37 @@ class DeformableDETR(nn.Module):
         return out
 
     @torch.no_grad()
-    def acl_fit(self, hs, target_classes_onehot):
-        temp_dataset = TensorDataset(hs, target_classes_onehot)
-        temp_dataloader = DataLoader(temp_dataset, batch_size=4, shuffle=True)
-        total_batches = len(temp_dataloader)
+    def acl_fit(self, dataloader_or_hs, target_classes_onehot=None):
+        if target_classes_onehot is not None:
+            hs = dataloader_or_hs.to("cpu")
+            target_classes_onehot = target_classes_onehot.to("cpu")
+            for i in range(len(self.class_embed_acil)):
+                self.class_embed_acil[i].fit(hs[:,i], target_classes_onehot)
+        else:
+            temp_dataloader = dataloader_or_hs
         
-        with tqdm(total=total_batches, desc="acl_fit", leave=True) as pbar:
-            for batch_idx, (batch_hs, batch_target_classes_onehot) in enumerate(temp_dataloader):
-                for i in range(len(self.class_embed_acil)):
-                    self.class_embed_acil[i].fit(batch_hs[:,i], batch_target_classes_onehot)
+            total_batches = len(temp_dataloader)
             
-                pbar.set_postfix(batch=f"{batch_idx+1}/{total_batches}")
-                pbar.update(1)
+            with tqdm(total=total_batches, desc="acl_fit", leave=True) as pbar:
+                for batch_idx, (batch_hs, batch_target_classes_onehot) in enumerate(temp_dataloader):
+                    if hasattr(self, 'device'):
+                        batch_hs = batch_hs.to("cpu")
+                        batch_target_classes_onehot = batch_target_classes_onehot.to("cpu")
+                        
+                    for i in range(len(self.class_embed_acil)):
+                        self.class_embed_acil[i].fit(batch_hs[:,i], batch_target_classes_onehot)
                 
-                del batch_target_classes_onehot  
-                del batch_hs  
+                    pbar.set_postfix(batch=f"{batch_idx+1}/{total_batches}")
+                    pbar.update(1)
+                    
+                    del batch_target_classes_onehot  
+                    del batch_hs  
+                    
+                    if batch_idx % 10 == 0:
+                        torch.cuda.empty_cache()
+
         torch.cuda.empty_cache()
-        gc.collect()  
+        gc.collect()
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord):
@@ -229,43 +243,6 @@ class DeformableDETR(nn.Module):
         for name, param in self.named_parameters():
             if 'bbox_embed' not in name and 'class_embed_acil' not in name:
                 param.requires_grad = False
-
-    # def modify_acl_mode(self, buffer_size=8192, gamma=1e-3):
-    #     self.use_acil = True
-
-    #     num_pred = len(self.class_embed)
-    #     hidden_dim = self.transformer.d_model
-    #     num_classes = self.class_embed[0].weight.shape[0]
-    #     device = self.class_embed[0].weight.device
-
-    #     new_classifier = ACILClassifierForDETR(hidden_dim, num_classes, buffer_size, gamma, device)
-
-    #     if self.with_box_refine:
-    #         new_class_embed = _get_clones(new_classifier, num_pred)
-    #     else:
-    #         new_class_embed = nn.ModuleList([new_classifier for _ in range(num_pred)])
-
-    #     self.class_embed = new_class_embed
-
-    #     if dist.is_initialized():
-    #         try:
-    #             for i in range(num_pred):
-    #                 for param in self.class_embed[i].parameters():
-    #                     dist.broadcast(param.data, src=0)
-    #         except Exception as e:
-    #             print(f"分布式参数广播失败: {e}")
-
-    #     if self.two_stage:
-    #         self.transformer.decoder.class_embed = self.class_embed
-    #         for box_embed in self.bbox_embed:
-    #             nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
-
-    #     # 冻结其余层
-    #     for name, param in self.named_parameters():
-    #         if 'bbox_embed' not in name and 'class_embed' not in name:
-    #             param.requires_grad = False
-
-            
             
 class SetCriterion(nn.Module):
     """ This class computes the loss for DETR.
@@ -290,6 +267,7 @@ class SetCriterion(nn.Module):
         self.losses = losses
         self.focal_alpha = focal_alpha
         self.acil_cache = []
+        self.cache = False
 
     def get_targets_classes_onehot(self,outputs,targets,indices):
         idx = get_src_permutation_idx_public(indices)
@@ -326,14 +304,14 @@ class SetCriterion(nn.Module):
         if not enable_aux:
             assert 'dec_outputs' in outputs
             hs = outputs['dec_outputs'] 
-
-            hs = hs.transpose(0,1).contiguous()
-            f_all= []
-            l_all= []
-            for f, l in zip(hs, target_classes_onehot):
-                f_all.append(f.detach().cpu())
-                l_all.append(l.detach().cpu())
-            self.acil_cache.append((torch.stack(f_all,dim=0), torch.stack(l_all,dim=0))) 
+            if self.cache:
+                hs = hs.transpose(0,1).contiguous()
+                f_all= []
+                l_all= []
+                for f, l in zip(hs, target_classes_onehot):
+                    f_all.append(f.detach().cpu())
+                    l_all.append(l.detach().cpu())
+                self.acil_cache.append((torch.stack(f_all,dim=0), torch.stack(l_all,dim=0))) 
         
         losses = {'loss_ce': loss_ce}
         
@@ -410,11 +388,6 @@ class SetCriterion(nn.Module):
         }
         return losses
 
-    # def _get_src_permutation_idx(self, indices):
-    #     # permute predictions following indices
-    #     batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
-    #     src_idx = torch.cat([src for (src, _) in indices])
-    #     return batch_idx, src_idx
 
     def _get_tgt_permutation_idx(self, indices):
         # permute targets following indices
@@ -502,7 +475,13 @@ class SetCriterion(nn.Module):
 
     def clear_acil_cache(self):
         self.acil_cache.clear()
+        self.cache = False
 
+    def modify_acil_cache(self):
+        self.cache = not self.cache
+        
+    def save_acil_cache(self, path):
+        torch.save(self.acil_cache, path)
     
     
 class PostProcess(nn.Module):

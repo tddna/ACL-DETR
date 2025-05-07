@@ -27,16 +27,57 @@ from util.report import save_evaluation_results
 
 from torch.utils.tensorboard import SummaryWriter
 
+
 torch.cuda.empty_cache()
+
+import os
+import torch
+
+import torch
+import os
+import glob
+
+def merge_epoch_cache(epoch, cache_dir="cache", world_size=None):
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # 查找所有rank文件
+    pattern = os.path.join(cache_dir, f"epoch_{epoch}_rank*.pth")
+    rank_files = glob.glob(pattern)
+    
+    if not rank_files:
+        raise FileNotFoundError(f"没有找到epoch {epoch}的缓存文件")
+        
+    # 合并所有rank文件
+    all_features, all_targets = [], []
+    for f in rank_files:
+        d = torch.load(f, map_location="cpu")
+        all_features.append(d["features"])
+        all_targets.append(d["targets"])
+    
+    # 保存合并文件
+    final_path = os.path.join(cache_dir, f"epoch_{epoch}_merged.pth")
+    torch.save({
+        "features": torch.cat(all_features, dim=0),
+        "targets": torch.cat(all_targets, dim=0)
+    }, final_path)
+    
+    # 删除原始rank文件
+    for f in rank_files:
+        os.remove(f)
+        
+    print(f"[✓] 合并完成epoch {epoch}缓存 -> {final_path}")
+
+
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Deformable DETR Detector', add_help=False)
-    parser.add_argument('--lr', default=2e-4, type=float)
+    parser.add_argument('--lr', default=4e-4, type=float)
     parser.add_argument('--lr_backbone_names', default=["backbone.0"], type=str, nargs='+')
     parser.add_argument('--lr_backbone', default=2e-5, type=float)
     parser.add_argument('--lr_linear_proj_names', default=['reference_points', 'sampling_offsets'], type=str, nargs='+')
     parser.add_argument('--lr_linear_proj_mult', default=0.1, type=float)
-    parser.add_argument('--batch_size', default=4, type=int)
+    parser.add_argument('--batch_size', default=2, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=1, type=int)
     parser.add_argument('--lr_drop', default=40, type=int)
@@ -134,7 +175,7 @@ def get_args_parser():
     # 在pycocotools.py中修改
     # 20 + 
     parser.add_argument('--num_of_phases', default=5, type=int)
-    parser.add_argument('--cls_per_phase', default=20, type=int)
+    parser.add_argument('--cls_per_phase', default=10, type=int)
     parser.add_argument('--data_setting', default='tfh', choices=['tfs', 'tfh'])
 
     parser.add_argument('--seed_cls', default=123, type=int)
@@ -142,16 +183,17 @@ def get_args_parser():
     parser.add_argument('--method', default='icarl', choices=['baseline', 'icarl'])
     parser.add_argument('--mem_rate', default=0.1, type=float)
 
-    parser.add_argument('--debug_mode', default=False, action='store_true')
-    parser.add_argument('--balanced_ft', default=True, action='store_true')
+    parser.add_argument('--debug_mode', default = False, action='store_true')
+    parser.add_argument('--balanced_ft', default=False, action='store_true')
     parser.add_argument('--total_num_classes', default=91, type=int)
     
     parser.add_argument('--use_acil', default=False, action='store_true')
-    parser.add_argument('--buffer_size', default=128, type=int)
+    parser.add_argument('--acil_cache', default=True, action='store_true')
+    parser.add_argument('--buffer_size', default= 2048, type=int)
     parser.add_argument('--gamma', default=1e-3, type=float)
     parser.add_argument('--acil_device', default='cpu', type=str)
-    
-
+    # parser.add_argument('--base_epochs', default=1, type=int)
+    # parser.add_argument('--realign_epochs', default=3, type=int)
     return parser
 
 def main(args):
@@ -192,6 +234,7 @@ def main(args):
         
         dataset_train = build_dataset(image_set='train', args=args, cls_order=cls_order, \
             phase_idx=phase_idx, incremental=True, incremental_val=False, val_each_phase=False)
+        print(f"len(dataset_train): {len(dataset_train)}")
         dataset_val = build_dataset(image_set='val', args=args, cls_order=cls_order, \
             phase_idx=phase_idx, incremental=True, incremental_val=True, val_each_phase=False)
 
@@ -296,11 +339,6 @@ def main(args):
                                             weight_decay=args.weight_decay)
             lr_scheduler_balanced = torch.optim.lr_scheduler.StepLR(optimizer_balanced, args.lr_drop_balanced)
 
-        # print('pytorch model distributed...')
-        # if args.distributed:
-        #     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
-        #     model_without_ddp = model.module
-
 
         ## e. 评估coco api构建
         base_ds = get_coco_api_from_dataset(dataset_val)
@@ -341,7 +379,7 @@ def main(args):
             for pg, pg_old in zip(optimizer.param_groups, p_groups):
                 pg['lr'] = pg_old['lr']
                 pg['initial_lr'] = pg_old['initial_lr']
-            print(optimizer.param_groups)
+            # print(optimizer.param_groups)
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             args.override_resumed_lr_drop = True
             if args.override_resumed_lr_drop:
@@ -352,33 +390,53 @@ def main(args):
             args.start_epoch = checkpoint['epoch'] + 1
         #################################################################################################
             # base training,前面部分应该更换为deformable detr的预训练模型
-            for epoch in range(0, 1):
-                if args.distributed:
-                    sampler_train.set_epoch(epoch)
+            # for epoch in range(args.epochs):
+            #     if args.distributed:
+            #         sampler_train.set_epoch(epoch)
+            #     if epoch == args.epochs - 1:
+            #         criterion.modify_acil_cache()
+            #     train_stats = train_one_epoch(
+            #         model, criterion,  data_loader_train, optimizer, device, epoch, args.clip_max_norm)
+            #     dist.barrier()  # 所有进程等待 rank 0 合并完成
 
-                train_stats = train_one_epoch(
-                    model, criterion,  data_loader_train, optimizer, device, epoch, args.clip_max_norm)
-
+            # # 保存criterion
+            # criterion.save_acil_cache(f'{args.output_dir}/acil_cache_{args.epochs}.pth')
+            
             test_stats, coco_evaluator = evaluate(
                 model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
             )
             print("Testing results for phase_0_base.")   
             save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_base')
-            
-            hs, target_classes_onehot = criterion.get_acil_cache()
             torch.cuda.empty_cache()
-  
-            model_without_ddp.modify_acl_mode(True)
-      
-            model.module.acl_fit(hs, target_classes_onehot)
             
+            model_without_ddp.modify_acl_mode(True)
+            # 加载acil cache
+            if args.acil_cache:
+                cache = torch.load(f'{args.output_dir}/acil_cache_{args.epochs}.pth')
+                hs = torch.cat([f for f, _ in cache], dim=0)
+                labels = torch.cat([l for _, l in cache], dim=0)
+            else:
+                hs,labels = criterion.get_acil_cache()
+            dataset = TensorDataset(hs,labels)
+            # for epoch in range(args.base_epochs):
+            # for epoch in range(args.realign_epochs):
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                num_replicas=dist.get_world_size(),
+                rank=dist.get_rank(),
+                shuffle=True
+            )
+            dataloader = DataLoader(dataset, batch_size=4, sampler=sampler)
+            
+            model.module.acl_fit(dataloader)
+                
             print("acl_fit done")
                 
-            # test_stats, coco_evaluator = evaluate(
-            #     model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
-            # )
-            # print("Testing results for phase_0.")   
-            # save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_realign')   
+            test_stats, coco_evaluator = evaluate(
+                model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
+            )
+            print("Testing results for phase_0.")   
+            save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix=f'{args.buffer_size}_{args.gamma}')   
             
             if args.output_dir:
                 checkpoint_paths = [output_dir / f'phase_{phase_idx}.pth']
@@ -394,33 +452,33 @@ def main(args):
         
         else:
             
-            for epoch in range(0, args.epochs):
-                if args.distributed:
-                    sampler_train.set_epoch(epoch)
-                train_stats = train_one_epoch_incremental(
-                    model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm)
+            # for epoch in range(0, args.epochs):
+            if args.distributed:
+                sampler_train.set_epoch(epoch)
+            train_stats = train_one_epoch_incremental(
+                model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm)
 
-                lr_scheduler.step()
+            lr_scheduler.step()
 
-                test_stats, coco_evaluator = evaluate(
-                    model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
-                )
-                print("Testing results for all.")
-                
-                save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_all')
-                
-                test_stats, coco_evaluator = evaluate(
-                    model, criterion, postprocessors, data_loader_val_old, base_ds_old, device, args.output_dir
-                )
-                print("Testing results for old.")  
-                save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_old')
+            test_stats, coco_evaluator = evaluate(
+                model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
+            )
+            print("Testing results for all.")
+            
+            save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_all')
+            
+            test_stats, coco_evaluator = evaluate(
+                model, criterion, postprocessors, data_loader_val_old, base_ds_old, device, args.output_dir
+            )
+            print("Testing results for old.")  
+            save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_old')
 
-                test_stats, coco_evaluator = evaluate(
-                    model, criterion, postprocessors, data_loader_val_new, base_ds_new, device, args.output_dir
-                )
-                print("Testing results for new.")   
-                save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_new')
-     
+            test_stats, coco_evaluator = evaluate(
+                model, criterion, postprocessors, data_loader_val_new, base_ds_new, device, args.output_dir
+            )
+            print("Testing results for new.")   
+            save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_new')
+    
             if args.balanced_ft :
                 for epoch in range(0, 1):
                     if args.distributed:

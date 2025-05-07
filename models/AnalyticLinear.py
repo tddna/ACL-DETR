@@ -80,6 +80,7 @@ class AnalyticLinear(torch.nn.Linear, metaclass=ABCMeta):
             "Setting self.dtype=torch.double also helps."
         )
 
+            
 
 class RecursiveLinear(AnalyticLinear):
     def __init__(
@@ -97,7 +98,7 @@ class RecursiveLinear(AnalyticLinear):
         self.R: torch.Tensor
         R = torch.eye(self.weight.shape[0], **factory_kwargs) / self.gamma
         self.register_buffer("R", R)
-
+        
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
 
@@ -134,18 +135,10 @@ class RecursiveLinear(AnalyticLinear):
             dist.barrier()
     # @torch.no_grad()
     # def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-    #     """The core code of the ACIL and the G-ACIL.
-    #     This implementation, which is different but equivalent to the equations shown in [1],
-    #     is proposed in the G-ACIL [4], which supports mini-batch learning and the general CIL setting.
-    #     """
-    #     # print("X.shape")
-    #     # print(X.shape)
-    #     # print("Y.shape")
-    #     # print(Y.shape)
-
     #     X = X.reshape(-1, X.shape[-1])
     #     Y = Y.reshape(-1, Y.shape[-1])
     #     X, Y = X.to(self.weight), Y.to(self.weight)
+
     #     if self.bias:
     #         X = torch.cat((X, torch.ones(X.shape[0], 1).to(X)), dim=-1)
 
@@ -158,31 +151,25 @@ class RecursiveLinear(AnalyticLinear):
     #         increment_size = self.out_features - num_targets
     #         tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
     #         Y = torch.cat((Y, tail), dim=1)
-            
-    #     K = torch.inverse(torch.eye(X.shape[0]).to(X) + X @ self.R @ X.T)
-    #     # Equation (10) of ACIL
-    #     self.R -= self.R @ X.T @ K @ X @ self.R
-    #     # Equation (9) of ACIL
-    #     self.weight += self.R @ X.T @ (Y - X @ self.weight)
-    #     # print(self.R.shape)
-    #     # Please update your PyTorch & CUDA if the `cusolver error` occurs.
-    #     # If you insist on using this version, doing the `torch.inverse` on CPUs might help.
-    #     # X_np = X.cpu().detach().numpy()
-    #     # R_np = self.R.cpu().detach().numpy()
 
-    #     # I_np = np.eye(X_np.shape[0], dtype=X_np.dtype)
-    #     # XR = np.matmul(X_np, R_np)
-    #     # XRXt = np.matmul(XR, X_np.T)
-    #     # K_inv_np = I_np + XRXt
+    #     # 本地计算更新项
+    #     K = torch.inverse(torch.eye(X.shape[0], device=X.device) + X @ self.R @ X.T)
+    #     delta_R = -self.R @ X.T @ K @ X @ self.R
+    #     delta_W = self.R @ X.T @ (Y - X @ self.weight)
 
-    #     # K_np = np.linalg.inv(K_inv_np)
+    #     # 汇总所有进程的 delta_R 和 delta_W
+    #     if dist.is_initialized():
+    #         dist.all_reduce(delta_R, op=dist.ReduceOp.SUM)
+    #         dist.all_reduce(delta_W, op=dist.ReduceOp.SUM)
+    #         delta_R /= dist.get_world_size()
+    #         delta_W /= dist.get_world_size()
 
-    #     # K = torch.from_numpy(K_np).to(self.weight.device)
+    #     # 全局一致更新
+    #     self.R += delta_R
+    #     self.weight += delta_W
 
-    #     # # Equation (10) of ACIL
-    #     # self.R -= self.R @ X.T @ K @ X @ self.R
-    #     # # Equation (9) of ACIL
-    #     # self.weight += self.R @ X.T @ (Y - X @ self.weight)
+    #     if dist.is_initialized():
+    #         dist.barrier()
 
 
 class GeneralizedARM(AnalyticLinear):
