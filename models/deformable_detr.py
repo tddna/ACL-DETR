@@ -267,7 +267,7 @@ class SetCriterion(nn.Module):
         self.losses = losses
         self.focal_alpha = focal_alpha
         self.acil_cache = []
-        self.cache = False
+        self.cache = True
 
     def get_targets_classes_onehot(self,outputs,targets,indices):
         idx = get_src_permutation_idx_public(indices)

@@ -1,74 +1,28 @@
 import argparse
 import datetime
+import glob
 import json
+import os
 import random
 import time
 from pathlib import Path
-import copy
-import os
 
+# 第三方库导入
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.utils.data import DataLoader, TensorDataset
+
+# 本地模块导入
 import datasets
 import util.misc as utils
-import datasets.samplers as samplers
 from datasets import build_dataset, get_coco_api_from_dataset
 from datasets.incremental import generate_cls_order
-from engine import evaluate, train_one_epoch, train_one_epoch_incremental
-from models import build_model
-from tensorboardX import SummaryWriter
-from tqdm import tqdm
-import torch.distributed as dist
-from engine import get_src_permutation_idx_public
-from torch.utils.data import TensorDataset 
- 
-from util.report import save_evaluation_results
+import datasets.samplers as samplers
+from engine import train_acl, train_base
 
-from torch.utils.tensorboard import SummaryWriter
-
-
+# 清空CUDA缓存
 torch.cuda.empty_cache()
-
-import os
-import torch
-
-import torch
-import os
-import glob
-
-def merge_epoch_cache(epoch, cache_dir="cache", world_size=None):
-    os.makedirs(cache_dir, exist_ok=True)
-    
-    # 查找所有rank文件
-    pattern = os.path.join(cache_dir, f"epoch_{epoch}_rank*.pth")
-    rank_files = glob.glob(pattern)
-    
-    if not rank_files:
-        raise FileNotFoundError(f"没有找到epoch {epoch}的缓存文件")
-        
-    # 合并所有rank文件
-    all_features, all_targets = [], []
-    for f in rank_files:
-        d = torch.load(f, map_location="cpu")
-        all_features.append(d["features"])
-        all_targets.append(d["targets"])
-    
-    # 保存合并文件
-    final_path = os.path.join(cache_dir, f"epoch_{epoch}_merged.pth")
-    torch.save({
-        "features": torch.cat(all_features, dim=0),
-        "targets": torch.cat(all_targets, dim=0)
-    }, final_path)
-    
-    # 删除原始rank文件
-    for f in rank_files:
-        os.remove(f)
-        
-    print(f"[✓] 合并完成epoch {epoch}缓存 -> {final_path}")
-
-
-
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Deformable DETR Detector', add_help=False)
@@ -174,6 +128,7 @@ def get_args_parser():
 
     # 在pycocotools.py中修改
     # 20 + 
+    parser.add_argument('--num_of_base',default=40,type=int)
     parser.add_argument('--num_of_phases', default=5, type=int)
     parser.add_argument('--cls_per_phase', default=10, type=int)
     parser.add_argument('--data_setting', default='tfh', choices=['tfs', 'tfh'])
@@ -199,39 +154,14 @@ def get_args_parser():
 def main(args):
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
-    
-    writer = SummaryWriter(log_dir="./logs")
-
-
-    device = torch.device(args.device)
-
     seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
-
-    model, criterion, postprocessors = build_model(args)
-    model.to(device)
-
-    model_without_ddp = model
-
+    
     cls_order = generate_cls_order(seed=args.seed_cls)   
 
-    if args.data_setting=='tfs':
-        total_phase_num = args.num_of_phases
-    elif args.data_setting=='tfh':
-        total_phase_num = args.num_of_phases
-    else:
-        raise ValueError('Please set the correct data setting.')
-    
-    print('pytorch model distributed...')
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
-        model_without_ddp = model.module
-    
-    for phase_idx in range(total_phase_num):
-        print('training phase '+ str(phase_idx) + '...')
-        
+    for phase_idx in range(args.num_of_phases):
         dataset_train = build_dataset(image_set='train', args=args, cls_order=cls_order, \
             phase_idx=phase_idx, incremental=True, incremental_val=False, val_each_phase=False)
         print(f"len(dataset_train): {len(dataset_train)}")
@@ -245,8 +175,7 @@ def main(args):
                 phase_idx=phase_idx-1, incremental=True, incremental_val=True, val_each_phase=False)
             dataset_val_new = build_dataset(image_set='val', args=args, cls_order=cls_order, \
                 phase_idx=phase_idx, incremental=True, incremental_val=True, val_each_phase=True)
-
-        # 分布式训练
+            
         if args.distributed:
             if args.cache_mode:
                 sampler_train = samplers.NodeDistributedSampler(dataset_train)
@@ -290,239 +219,17 @@ def main(args):
             data_loader_val_old = DataLoader(dataset_val_old, args.batch_size, sampler=sampler_val_old, drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers, pin_memory=True)
             data_loader_val_new = DataLoader(dataset_val_new, args.batch_size, sampler=sampler_val_new, drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers, pin_memory=True)
 
-        ## b.  匹配参数
-        def match_name_keywords(n, name_keywords):
-            out = False
-            for b in name_keywords:
-                if b in n:
-                    out = True
-                    break
-            return out
-
-        # for n, p in model_without_ddp.named_parameters():
-        #     print(n)
-
-        # 参数分组
-        param_dicts = [
-            {
-                "params":
-                    [p for n, p in model_without_ddp.named_parameters()
-                    if not match_name_keywords(n, args.lr_backbone_names) and not match_name_keywords(n, args.lr_linear_proj_names) and p.requires_grad],
-                "lr": args.lr,
-            },
-            {
-                "params": [p for n, p in model_without_ddp.named_parameters() if match_name_keywords(n, args.lr_backbone_names) and p.requires_grad],
-                "lr": args.lr_backbone,
-            },
-            {
-                "params": [p for n, p in model_without_ddp.named_parameters() if match_name_keywords(n, args.lr_linear_proj_names) and p.requires_grad],
-                "lr": args.lr * args.lr_linear_proj_mult,
-            }
-        ]
-
-        print('setting the optimizer...')
-        
-        if args.sgd:
-            optimizer = torch.optim.SGD(param_dicts, lr=args.lr, momentum=0.9,
-                                        weight_decay=args.weight_decay)
-        else:
-            optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
-                                        weight_decay=args.weight_decay)
-        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
-
-        if phase_idx >= 1:
-            if args.sgd:
-                optimizer_balanced = torch.optim.SGD(param_dicts, lr=args.lr, momentum=0.9,
-                                            weight_decay=args.weight_decay)
-            else:
-                optimizer_balanced = torch.optim.AdamW(param_dicts, lr=args.lr,
-                                            weight_decay=args.weight_decay)
-            lr_scheduler_balanced = torch.optim.lr_scheduler.StepLR(optimizer_balanced, args.lr_drop_balanced)
-
-
-        ## e. 评估coco api构建
         base_ds = get_coco_api_from_dataset(dataset_val)
         if phase_idx >= 1:
             base_ds_old = get_coco_api_from_dataset(dataset_val_old)
             base_ds_new = get_coco_api_from_dataset(dataset_val_new)
-
-        # ## f. 加载预训练模型
-        # if args.frozen_weights is not None:
-        #     checkpoint = torch.load(args.frozen_weights, map_location='cpu')
-        #     model_without_ddp.detr.load_state_dict(checkpoint['model'])
-
-        ## g. 输出目录
-        this_phase_output_dir = args.output_dir + '/phase_'+str(phase_idx)
-        output_dir = Path(this_phase_output_dir)
-        Path(this_phase_output_dir).mkdir(parents=True, exist_ok=True)
-
-        ## h. 训练
-        print("start training")
-        start_time = time.time()
-        epoch = 0
-
-        ### h1.base training e.g 在40上训练
-        if phase_idx==0:
-        #################################################################################################
-            ckpt_path = './phase_0.pth'          
-            checkpoint = torch.load(ckpt_path, map_location='cpu')
-
-            missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
-            unexpected_keys = [k for k in unexpected_keys if not (k.endswith('total_params') or k.endswith('total_ops'))]
-            if len(missing_keys) > 0:
-                print('Missing Keys: {}'.format(missing_keys))
-            if len(unexpected_keys) > 0:
-                print('Unexpected Keys: {}'.format(unexpected_keys))
             
-            p_groups = copy.deepcopy(optimizer.param_groups)
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            for pg, pg_old in zip(optimizer.param_groups, p_groups):
-                pg['lr'] = pg_old['lr']
-                pg['initial_lr'] = pg_old['initial_lr']
-            # print(optimizer.param_groups)
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            args.override_resumed_lr_drop = True
-            if args.override_resumed_lr_drop:
-                print('Warning: (hack) args.override_resumed_lr_drop is set to True, so args.lr_drop would override lr_drop in resumed lr_scheduler.')
-                lr_scheduler.step_size = args.lr_drop
-                lr_scheduler.base_lrs = list(map(lambda group: group['initial_lr'], optimizer.param_groups))
-            lr_scheduler.step(lr_scheduler.last_epoch)
-            args.start_epoch = checkpoint['epoch'] + 1
-        #################################################################################################
-            # base training,前面部分应该更换为deformable detr的预训练模型
-            # for epoch in range(args.epochs):
-            #     if args.distributed:
-            #         sampler_train.set_epoch(epoch)
-            #     if epoch == args.epochs - 1:
-            #         criterion.modify_acil_cache()
-            #     train_stats = train_one_epoch(
-            #         model, criterion,  data_loader_train, optimizer, device, epoch, args.clip_max_norm)
-            #     dist.barrier()  # 所有进程等待 rank 0 合并完成
-
-            # # 保存criterion
-            # criterion.save_acil_cache(f'{args.output_dir}/acil_cache_{args.epochs}.pth')
-            
-            test_stats, coco_evaluator = evaluate(
-                model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
-            )
-            print("Testing results for phase_0_base.")   
-            save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_base')
-            torch.cuda.empty_cache()
-            
-            model_without_ddp.modify_acl_mode(True)
-            # 加载acil cache
-            if args.acil_cache:
-                cache = torch.load(f'{args.output_dir}/acil_cache_{args.epochs}.pth')
-                hs = torch.cat([f for f, _ in cache], dim=0)
-                labels = torch.cat([l for _, l in cache], dim=0)
-            else:
-                hs,labels = criterion.get_acil_cache()
-            dataset = TensorDataset(hs,labels)
-            # for epoch in range(args.base_epochs):
-            # for epoch in range(args.realign_epochs):
-            sampler = torch.utils.data.distributed.DistributedSampler(
-                dataset,
-                num_replicas=dist.get_world_size(),
-                rank=dist.get_rank(),
-                shuffle=True
-            )
-            dataloader = DataLoader(dataset, batch_size=4, sampler=sampler)
-            
-            model.module.acl_fit(dataloader)
-                
-            print("acl_fit done")
-                
-            test_stats, coco_evaluator = evaluate(
-                model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
-            )
-            print("Testing results for phase_0.")   
-            save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix=f'{args.buffer_size}_{args.gamma}')   
-            
-            if args.output_dir:
-                checkpoint_paths = [output_dir / f'phase_{phase_idx}.pth']
-
-                for checkpoint_path in checkpoint_paths:
-                    utils.save_on_master({
-                        'model': model_without_ddp.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'lr_scheduler': lr_scheduler.state_dict(),
-                        'epoch': epoch,
-                        'args': args,
-                    }, checkpoint_path)
-        
+        if phase_idx == 0 :
+            train_base(args,data_loader_train,data_loader_val,base_ds)
+            train_acl(args,data_loader_train,data_loader_val,phase_idx,base_ds)
         else:
-            
-            # for epoch in range(0, args.epochs):
-            if args.distributed:
-                sampler_train.set_epoch(epoch)
-            train_stats = train_one_epoch_incremental(
-                model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm)
-
-            lr_scheduler.step()
-
-            test_stats, coco_evaluator = evaluate(
-                model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
-            )
-            print("Testing results for all.")
-            
-            save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_all')
-            
-            test_stats, coco_evaluator = evaluate(
-                model, criterion, postprocessors, data_loader_val_old, base_ds_old, device, args.output_dir
-            )
-            print("Testing results for old.")  
-            save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_old')
-
-            test_stats, coco_evaluator = evaluate(
-                model, criterion, postprocessors, data_loader_val_new, base_ds_new, device, args.output_dir
-            )
-            print("Testing results for new.")   
-            save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_new')
-    
-            if args.balanced_ft :
-                for epoch in range(0, 1):
-                    if args.distributed:
-                        sampler_train_balanced.set_epoch(epoch)
-
-                    train_stats = train_one_epoch(
-                        model, criterion, data_loader_train_balanced, optimizer_balanced, device, epoch, args.clip_max_norm)
-                    lr_scheduler_balanced.step()
-
-                    if phase_idx >= 1:
-                        test_stats, coco_evaluator = evaluate(
-                            model, criterion, postprocessors, data_loader_val_old, base_ds_old, device, args.output_dir
-                        )
-                        print("Balanced FT - Testing results for old.")                    
-                        test_stats, coco_evaluator = evaluate(
-                            model, criterion, postprocessors, data_loader_val_new, base_ds_new, device, args.output_dir
-                        )
-                        print("Balanced FT - Testing results for new.")   
-                        
-                    test_stats, coco_evaluator = evaluate(model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir)
-                    print("Balanced FT - Testing results for all.")                           
-                save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_F-all')
-            
-            if args.output_dir:
-                checkpoint_paths = [output_dir / f'phase_{phase_idx}.pth']
-
-                for checkpoint_path in checkpoint_paths:
-                    utils.save_on_master({
-                        'model': model_without_ddp.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'lr_scheduler': lr_scheduler.state_dict(),
-                        'epoch': epoch,
-                        'args': args,
-                    }, checkpoint_path)
-
-            total_time = time.time() - start_time
-            total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-            print('Training time {}'.format(total_time_str))
-
-            # 在主训练循环中
-            optimizer.zero_grad()
-            torch.cuda.synchronize()
-            dist.barrier()  # 添加额外同步点
-
+            train_acl(args,data_loader_train,data_loader_val,phase_idx,base_ds)
+       
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Deformable DETR training and evaluation script', parents=[get_args_parser()])
     args = parser.parse_args()
@@ -533,5 +240,6 @@ if __name__ == '__main__':
         args.batch_size = 2     
 
     if args.output_dir:
+        print(args.output_dir)
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
