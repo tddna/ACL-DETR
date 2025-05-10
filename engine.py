@@ -12,6 +12,7 @@ from datasets.coco_eval import CocoEvaluator
 from datasets.panoptic_eval import PanopticEvaluator
 from datasets.data_prefetcher import data_prefetcher
 import torch.distributed as dist
+from tqdm import tqdm
 
 from models.ACIL import get_src_permutation_idx_public
 
@@ -88,10 +89,15 @@ def train_one_epoch_incremental(model: torch.nn.Module, criterion: torch.nn.Modu
 
     prefetcher = data_prefetcher(data_loader, device, prefetch=True)
     samples, targets = prefetcher.next()
-
+    
+    hs_cache = []
+    labels_cache = []
     # for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
-    for _ in metric_logger.log_every(range(len(data_loader)), print_freq, header):
-        outputs = model(samples)
+    for _ in tqdm(range(len(data_loader)), desc="pre"):
+        if torch.cuda.device_count() > 1:
+            outputs = model.module.forward(samples)
+        else:
+            outputs = model(samples)
         src_logits = outputs['pred_logits']
 
         loss_dict = criterion(outputs, targets)
@@ -137,11 +143,9 @@ def train_one_epoch_incremental(model: torch.nn.Module, criterion: torch.nn.Modu
         hs = outputs['dec_outputs']
         hs = hs.transpose(0,1).contiguous()
         
-        if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-            model.module.acl_fit(hs, target_classes_onehot)
-        else:
-            model.acl_fit(hs, target_classes_onehot)
-
+        # 将当前批次数据添加到缓存
+        hs_cache.append(hs)
+        labels_cache.append(target_classes_onehot)
             
         if dist.is_initialized():
             dist.barrier()
@@ -150,9 +154,40 @@ def train_one_epoch_incremental(model: torch.nn.Module, criterion: torch.nn.Modu
         metric_logger.update(class_error=loss_dict_reduced['class_error'])
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(grad_norm=grad_total_norm)
-        
-
+    
         samples, targets = prefetcher.next()
+        
+    all_hs = torch.cat(hs_cache, dim=0)
+    all_labels = torch.cat(labels_cache, dim=0)
+    # 创建TensorDataset和DataLoader
+    dataset = torch.utils.data.TensorDataset(all_hs, all_labels)
+    
+    # 分布式训练支持
+    if dist.is_available() and dist.is_initialized():
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset,
+            num_replicas=dist.get_world_size(),
+            rank=dist.get_rank(),
+            shuffle=True
+        )
+    else:
+        sampler = torch.utils.data.RandomSampler(dataset)
+    
+    # 创建DataLoader
+    acl_batch_size = 4  # 可以通过参数调整
+    acl_dataloader = torch.utils.data.DataLoader(
+        dataset, 
+        batch_size=acl_batch_size,
+        sampler=sampler
+    )
+    
+    # 使用DataLoader进行acl_fit
+    print("Starting ACL fitting...")
+    if torch.cuda.device_count() > 1:
+        model.module.acl_fit(acl_dataloader)
+    else:
+        model.acl_fit(acl_dataloader)
+    
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)

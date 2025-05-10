@@ -438,20 +438,19 @@ def main(args):
             print("Testing results for phase_0.")   
             save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix=f'{args.buffer_size}_{args.gamma}')   
             
-            if args.output_dir:
-                checkpoint_paths = [output_dir / f'phase_{phase_idx}.pth']
-
-                for checkpoint_path in checkpoint_paths:
-                    utils.save_on_master({
-                        'model': model_without_ddp.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'lr_scheduler': lr_scheduler.state_dict(),
-                        'epoch': epoch,
-                        'args': args,
-                    }, checkpoint_path)
+            model_path = output_dir / f'phase_{phase_idx}.pth'
+            torch.save(model_without_ddp.state_dict(), model_path)
         
         else:
+            state_dict = torch.load(f'{args.output_dir}/phase_{phase_idx-1}/phase_{phase_idx-1}.pth')
+            model = model.module
+            model.load_state_dict(state_dict)
+            model.to(device)
             
+            
+            if args.distributed:
+                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+                model_without_ddp = model.module            
             # for epoch in range(0, args.epochs):
             if args.distributed:
                 sampler_train.set_epoch(epoch)
@@ -502,17 +501,8 @@ def main(args):
                     print("Balanced FT - Testing results for all.")                           
                 save_evaluation_results(args.output_dir, phase_idx, test_stats, coco_evaluator, suffix='_F-all')
             
-            if args.output_dir:
-                checkpoint_paths = [output_dir / f'phase_{phase_idx}.pth']
-
-                for checkpoint_path in checkpoint_paths:
-                    utils.save_on_master({
-                        'model': model_without_ddp.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'lr_scheduler': lr_scheduler.state_dict(),
-                        'epoch': epoch,
-                        'args': args,
-                    }, checkpoint_path)
+            model_path = output_dir / f'phase_{phase_idx}.pth'
+            torch.save(model_without_ddp.state_dict(), model_path)
 
             total_time = time.time() - start_time
             total_time_str = str(datetime.timedelta(seconds=int(total_time)))

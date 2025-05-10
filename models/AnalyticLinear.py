@@ -70,7 +70,7 @@ class AnalyticLinear(torch.nn.Linear, metaclass=ABCMeta):
         self.weight = torch.zeros((self.weight.shape[0], 0)).to(self.weight)
 
     @abstractmethod
-    def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
+    def fit(self, X: torch.Tensor, Y: torch.Tensor, return_updates: bool = False, is_distributed: bool = False) -> None or dict:
         raise NotImplementedError()
 
     def update(self) -> None:
@@ -100,8 +100,25 @@ class RecursiveLinear(AnalyticLinear):
         self.register_buffer("R", R)
         
     @torch.no_grad()
-    def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-
+    def fit(self, X: torch.Tensor, Y: torch.Tensor, return_updates: bool = False, is_distributed: bool = False) -> None or dict:
+        """
+        拟合线性分类器
+        
+        参数:
+            X: torch.Tensor - 输入特征
+            Y: torch.Tensor - 目标标签(one-hot编码)
+            return_updates: bool - 是否返回更新值而不是直接应用
+            is_distributed: bool - 是否处于分布式环境
+        
+        返回:
+            None 或 包含更新参数的字典
+        """
+        # 保存当前参数状态
+        if return_updates:
+            old_weight = self.weight.clone() if hasattr(self, 'weight') else None
+            old_bias = self.bias.clone() if hasattr(self, 'bias') else None
+            old_R = self.R.clone() if hasattr(self, 'R') else None
+        
         X = X.reshape(-1, X.shape[-1])
         Y = Y.reshape(-1, Y.shape[-1])
         X, Y = X.to(self.weight), Y.to(self.weight)
@@ -133,43 +150,26 @@ class RecursiveLinear(AnalyticLinear):
             
             torch.cuda.synchronize()
             dist.barrier()
-    # @torch.no_grad()
-    # def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-    #     X = X.reshape(-1, X.shape[-1])
-    #     Y = Y.reshape(-1, Y.shape[-1])
-    #     X, Y = X.to(self.weight), Y.to(self.weight)
 
-    #     if self.bias:
-    #         X = torch.cat((X, torch.ones(X.shape[0], 1).to(X)), dim=-1)
-
-    #     num_targets = Y.shape[1]
-    #     if num_targets > self.out_features:
-    #         increment_size = num_targets - self.out_features
-    #         tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
-    #         self.weight = torch.cat((self.weight, tail), dim=1)
-    #     elif num_targets < self.out_features:
-    #         increment_size = self.out_features - num_targets
-    #         tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
-    #         Y = torch.cat((Y, tail), dim=1)
-
-    #     # 本地计算更新项
-    #     K = torch.inverse(torch.eye(X.shape[0], device=X.device) + X @ self.R @ X.T)
-    #     delta_R = -self.R @ X.T @ K @ X @ self.R
-    #     delta_W = self.R @ X.T @ (Y - X @ self.weight)
-
-    #     # 汇总所有进程的 delta_R 和 delta_W
-    #     if dist.is_initialized():
-    #         dist.all_reduce(delta_R, op=dist.ReduceOp.SUM)
-    #         dist.all_reduce(delta_W, op=dist.ReduceOp.SUM)
-    #         delta_R /= dist.get_world_size()
-    #         delta_W /= dist.get_world_size()
-
-    #     # 全局一致更新
-    #     self.R += delta_R
-    #     self.weight += delta_W
-
-    #     if dist.is_initialized():
-    #         dist.barrier()
+        # 如果需要返回更新而非应用
+        if return_updates:
+            updates = {}
+            if hasattr(self, 'weight'):
+                updates['weight'] = self.weight.clone()
+                # 恢复原始参数
+                self.weight.copy_(old_weight)
+            
+            if hasattr(self, 'bias'):
+                updates['bias'] = self.bias.clone()
+                # 恢复原始参数  
+                self.bias.copy_(old_bias)
+                
+            if hasattr(self, 'R'):
+                updates['R'] = self.R.clone()
+                # 恢复原始参数
+                self.R.copy_(old_R)
+            
+            return updates
 
 
 class GeneralizedARM(AnalyticLinear):

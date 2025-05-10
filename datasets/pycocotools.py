@@ -237,8 +237,8 @@ class COCO:
                     if phase_idx == 0:
                         num_img_this_phase = int(total_num_img_dataset/2)
                     else:
-                        #num_img_this_phase = int((total_num_img_dataset/2)/num_of_phases)
-                        num_img_this_phase = int(total_num_img_dataset/2)
+                        num_img_this_phase = int((total_num_img_dataset/2)/num_of_phases)
+                        # num_img_this_phase = int(total_num_img_dataset/2)
                 else:
                     raise ValueError('Please set the correct data setting.')
             else:

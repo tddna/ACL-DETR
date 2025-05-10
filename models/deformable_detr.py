@@ -196,38 +196,52 @@ class DeformableDETR(nn.Module):
         return out
 
     @torch.no_grad()
-    def acl_fit(self, dataloader_or_hs, target_classes_onehot=None):
-        if target_classes_onehot is not None:
-            hs = dataloader_or_hs.to("cpu")
-            target_classes_onehot = target_classes_onehot.to("cpu")
-            for i in range(len(self.class_embed_acil)):
-                self.class_embed_acil[i].fit(hs[:,i], target_classes_onehot)
-        else:
-            temp_dataloader = dataloader_or_hs
+    def acl_fit(self, temp_dataloader):
+        device = torch.device("cuda")
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        is_main_process = rank == 0
+        is_distributed = world_size > 1
         
-            total_batches = len(temp_dataloader)
+        # 只在主进程显示进度条
+        pbar = tqdm(total=len(temp_dataloader), desc="acl_fit", disable=not is_main_process)
+        
+        for batch_idx, (batch_hs, batch_target_classes_onehot) in enumerate(temp_dataloader):
+            batch_hs = batch_hs.to(device)
+            batch_target_classes_onehot = batch_target_classes_onehot.to(device)
             
-            with tqdm(total=total_batches, desc="acl_fit", leave=True) as pbar:
-                for batch_idx, (batch_hs, batch_target_classes_onehot) in enumerate(temp_dataloader):
-                    if hasattr(self, 'device'):
-                        batch_hs = batch_hs.to("cpu")
-                        batch_target_classes_onehot = batch_target_classes_onehot.to("cpu")
-                        
-                    for i in range(len(self.class_embed_acil)):
-                        self.class_embed_acil[i].fit(batch_hs[:,i], batch_target_classes_onehot)
+            for i in range(len(self.class_embed_acil)):
+                self.class_embed_acil[i].to(device)
                 
-                    pbar.set_postfix(batch=f"{batch_idx+1}/{total_batches}")
-                    pbar.update(1)
+                if is_distributed:
+                    # 获取但不应用更新
+                    self.class_embed_acil[i].fit(batch_hs[:,i], batch_target_classes_onehot)
+                else:
+                    # 非分布式环境直接应用更新
+                    self.class_embed_acil[i].fit(batch_hs[:,i], batch_target_classes_onehot)
+            
+            if is_main_process:
+                pbar.update(1)
+            
+            # 内存清理
+            del batch_hs
+            del batch_target_classes_onehot
+            if batch_idx % 5 == 0:
+                torch.cuda.empty_cache()
+            
+            if is_distributed:
+                dist.barrier()
+        
+        if is_main_process:
+            pbar.close()
+        
+        # 最终确保所有进程模型参数一致
+        for i in range(len(self.class_embed_acil)):
+            for param_name, param in self.class_embed_acil[i].named_parameters():
+                if param.requires_grad:
+                    dist.broadcast(param.data, 0)              
+                        
                     
-                    del batch_target_classes_onehot  
-                    del batch_hs  
-                    
-                    if batch_idx % 10 == 0:
-                        torch.cuda.empty_cache()
-
-        torch.cuda.empty_cache()
-        gc.collect()
-
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord):
         # this is a workaround to make torchscript happy, as torchscript
@@ -239,11 +253,11 @@ class DeformableDETR(nn.Module):
     def modify_acl_mode(self,use_acil=True):
         self.use_acil = use_acil
         
-       # 冻结其余层
+    # 冻结其余层
         for name, param in self.named_parameters():
             if 'bbox_embed' not in name and 'class_embed_acil' not in name:
                 param.requires_grad = False
-            
+                
 class SetCriterion(nn.Module):
     """ This class computes the loss for DETR.
     The process happens in two steps:
